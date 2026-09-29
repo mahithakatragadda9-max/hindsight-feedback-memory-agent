@@ -43,6 +43,11 @@ class FeedbackItem:
     product_version: Optional[str] = None
     analysis: Optional[FeedbackAnalysis] = None
     lifecycle: str = LifecycleState.NOVEL.value
+    source_id: Optional[str] = None
+    wave_id: Optional[str] = None
+    segment: Optional[str] = None
+    rating: Optional[float] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def new(workspace: str, channel: str, text: str, source_type: str = "live") -> "FeedbackItem":
@@ -67,6 +72,11 @@ class FeedbackItem:
             "product_version": self.product_version,
             "analysis": self.analysis.to_dict() if self.analysis else None,
             "lifecycle": self.lifecycle,
+            "source_id": self.source_id,
+            "wave_id": self.wave_id,
+            "segment": self.segment,
+            "rating": self.rating,
+            "metadata": self.metadata,
         }
         return rec
 

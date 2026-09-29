@@ -128,9 +128,10 @@ class HindsightClient:
         workspace_tag = self._workspace_tag(workspace)
 
         payload = {
+            # Isolation is enforced by the tag filter below, never by the wording
+            # of the query, so the internal workspace id is kept out of it.
             "query": (
-                "Find previous customer experiences relevant to this "
-                f"feedback within the {workspace} workspace.\n"
+                "Find previous customer experiences relevant to this feedback.\n"
                 f"Current feedback context: {query}"
             ),
 
@@ -192,10 +193,7 @@ class HindsightClient:
                 if memory is None:
                     continue
 
-                if (
-                    memory.workspace.strip().lower()
-                    != workspace.lower()
-                ):
+                if memory.workspace.strip() != workspace:
                     continue
 
                 output.append(memory)
@@ -257,7 +255,7 @@ class HindsightClient:
         result_workspace = str(result_workspace).strip()
 
         # Hard workspace isolation.
-        if result_workspace.lower() != workspace.lower():
+        if result_workspace != workspace.strip():
             return None
 
         return Memory(
@@ -356,6 +354,11 @@ class HindsightClient:
 
             key = key.strip()
             value = value.strip()
+
+            # The "Workspace" header is written first by retain(); a later line of
+            # free-text feedback that mimics it must never override it.
+            if key == "Workspace" and key in parsed:
+                continue
 
             if key:
                 parsed[key] = value

@@ -7,11 +7,13 @@ from storage import (
     load_product_changes,
     load_all_feedback,
     append_product_change,
+    workspace_display_name,
 )
 from llm import analyze_feedback, evaluate_evidence_llm, GroqUnavailable
 from hindsight_client import HindsightClient, HindsightUnavailable
 from relevance import build_evidence
 from lifecycle import classify_lifecycle
+from teach import apply_taught_theme, is_teaching_memory, load_rules
 
 
 _hindsight = HindsightClient()
@@ -42,13 +44,21 @@ def process_feedback(
     channel: str,
     text: str,
     source_type: str = "live",
+    use_memory: bool = True,
 ) -> dict:
+    """Analyze one feedback item.
+
+    use_memory=False is the Agent Memory OFF mode: Hindsight is neither
+    recalled nor written for this operation. Existing memories are untouched.
+    """
     result: dict = {
         "ok": False,
         "stage": "init",
         "memory_status": "not_attempted",
         "memory_message": "",
         "hindsight_used": False,
+        "memory_enabled": use_memory,
+        "workspace": workspace,  # internal workspace_id; lets the UI scope last_result
     }
 
     if not text or not text.strip():
@@ -60,31 +70,42 @@ def process_feedback(
     # 1. Analysis
     result["stage"] = "analysis"
     try:
-        item.analysis = analyze_feedback(text, workspace, channel)
+        item.analysis = analyze_feedback(text, workspace_display_name(workspace), channel)
     except GroqUnavailable as e:
         result["error"] = str(e)
         return result
 
     analysis = item.analysis
+    # Taught corrections override the theme deterministically (workspace-scoped).
+    taught = apply_taught_theme(analysis, text, workspace)
 
     # 2. Recall from Hindsight
     result["stage"] = "recall"
     memories: list[Memory] = []
-    try:
-        memories = _hindsight.recall(
-            query=f"{analysis.underlying_issue} | {analysis.theme} | {analysis.affected_capability}",
-            workspace=workspace,
-            top_k=20,
-        )
-        result["memory_status"] = "ok"
-        result["hindsight_used"] = True
-        result["memory_message"] = f"Recalled {len(memories)} candidate memories from Hindsight."
-    except HindsightUnavailable as e:
-        result["memory_status"] = "unavailable"
+    if not use_memory:
+        # Memory OFF: no Hindsight recall at all for this operation.
+        result["memory_status"] = "disabled"
         result["memory_message"] = (
-            "⚠ Hindsight unavailable — feedback was analyzed, but persistent "
-            f"memory could not be used. ({e})"
+            "Memory OFF — current feedback only. Hindsight recall and retain "
+            "were skipped; stored memories are untouched."
         )
+    else:
+        try:
+            memories = _hindsight.recall(
+                query=f"{analysis.underlying_issue} | {analysis.theme} | {analysis.affected_capability}",
+                workspace=workspace,
+                top_k=20,
+            )
+            result["memory_status"] = "ok"
+            result["hindsight_used"] = True
+            memories = [m for m in memories if not is_teaching_memory(m)]
+            result["memory_message"] = f"Recalled {len(memories)} candidate memories from Hindsight."
+        except HindsightUnavailable as e:
+            result["memory_status"] = "unavailable"
+            result["memory_message"] = (
+                "⚠ Hindsight unavailable — feedback was analyzed, but persistent "
+                f"memory could not be used. ({e})"
+            )
 
     # 3. Evidence evaluation
     result["stage"] = "evidence"
@@ -133,7 +154,8 @@ def process_feedback(
 
     # 4. Lifecycle
     result["stage"] = "lifecycle"
-    all_records = load_all_feedback()
+    # Workspace-scoped: lifecycle history must never see another workspace's records.
+    all_records = [r for r in load_all_feedback() if r.get("workspace") == workspace]
 
     # Prefer the LLM's product-change match when available.
     if llm_matched_change_id:
@@ -152,6 +174,8 @@ def process_feedback(
         current_feedback_id=item.feedback_id,
     )
     item.lifecycle = lifecycle.value
+    if taught:
+        reason += f" Theme set to '{taught['theme']}' by a taught correction (matched \"{taught['phrase']}\")."
 
     # 5. Persist live feedback
     result["stage"] = "persist"
@@ -159,15 +183,16 @@ def process_feedback(
 
     # 6. Retain in Hindsight
     result["stage"] = "retain"
-    memory = _memory_from_item(item, lifecycle.value, reason)
-    try:
-        _hindsight.retain(memory)
-        if result["memory_status"] == "ok":
-            result["memory_message"] += " New experience retained in Hindsight."
-    except HindsightUnavailable as e:
-        if result["memory_status"] == "ok":
-            result["memory_status"] = "partial"
-        result["memory_message"] += f" Retain skipped: {e}"
+    if use_memory:
+        memory = _memory_from_item(item, lifecycle.value, reason)
+        try:
+            _hindsight.retain(memory)
+            if result["memory_status"] == "ok":
+                result["memory_message"] += " New experience retained in Hindsight."
+        except HindsightUnavailable as e:
+            if result["memory_status"] == "ok":
+                result["memory_status"] = "partial"
+            result["memory_message"] += f" Retain skipped: {e}"
 
     result["ok"] = True
     result["item"] = item
@@ -226,6 +251,7 @@ def import_records(
     failures: list[str] = []
 
     total = len(records)
+    rules = load_rules(workspace)
     for i, row in enumerate(records):
         normalized = normalize_imported_record(row, workspace, source_type)
         if normalized is None:
@@ -235,7 +261,8 @@ def import_records(
         imported += 1
 
         try:
-            analysis = analyze_feedback(normalized["text"], workspace, normalized["channel"])
+            analysis = analyze_feedback(normalized["text"], workspace_display_name(workspace), normalized["channel"])
+            apply_taught_theme(analysis, normalized["text"], workspace, rules)
             normalized["analysis"] = analysis.to_dict()
             themes.add(analysis.theme)
             analyzed += 1
@@ -273,6 +300,96 @@ def import_records(
 
     return {
         "imported": imported,
+        "analyzed": analyzed,
+        "retained": retained,
+        "themes": len(themes),
+        "failures": failures[:3],
+    }
+
+
+def import_normalized(
+    records: list[dict],
+    workspace: str,
+    source_type: str = "uploaded",
+    progress_cb=None,
+) -> dict:
+    """Analyze + persist + retain records already normalized by csv_ingest.
+
+    Each record: id, wave_id, timestamp, channel, segment, text, rating, metadata.
+    All counts returned are computed in Python (never by the LLM).
+    """
+    upload_id = uuid.uuid4().hex[:8]
+    analyzed = 0
+    retained = 0
+    themes: set[str] = set()
+    failures: list[str] = []
+    total = len(records)
+    rules = load_rules(workspace)
+
+    for i, rec in enumerate(records):
+        analysis = None
+        try:
+            analysis = analyze_feedback(rec["text"], workspace_display_name(workspace), rec["channel"])
+            apply_taught_theme(analysis, rec["text"], workspace, rules)
+            analyzed += 1
+            if analysis.theme:
+                themes.add(analysis.theme)
+        except Exception as e:  # GroqUnavailable, bad JSON from the model, etc.
+            failures.append(str(e))
+
+        feedback_id = f"{upload_id}:{rec['id']}"
+        save_live_feedback({
+            "feedback_id": feedback_id,
+            "workspace": workspace,
+            "channel": rec["channel"],
+            "timestamp": rec["timestamp"],
+            "text": rec["text"],
+            "source_type": source_type,
+            "persona": rec.get("segment") or None,
+            "product_version": None,
+            "analysis": analysis.to_dict() if analysis else None,
+            "lifecycle": LifecycleState.NOVEL.value,
+            "source_id": rec["id"],
+            "wave_id": rec["wave_id"],
+            "segment": rec.get("segment") or None,
+            "rating": rec.get("rating"),
+            "metadata": rec.get("metadata") or {},
+        })
+
+        if analysis:
+            meta = {"wave_id": rec["wave_id"], "source_id": str(rec["id"])}
+            if rec.get("segment"):
+                meta["segment"] = str(rec["segment"])
+            if rec.get("rating") is not None:
+                meta["rating"] = str(rec["rating"])
+            mem = Memory(
+                memory_id=str(uuid.uuid4()),
+                feedback_id=feedback_id,
+                workspace=workspace,
+                timestamp=rec["timestamp"],
+                channel=rec["channel"],
+                raw_text=rec["text"],
+                discovered_theme=analysis.theme,
+                underlying_issue=analysis.underlying_issue,
+                sentiment=analysis.sentiment,
+                priority=analysis.priority,
+                agent_interpretation="Imported historical experience.",
+                affected_capability=analysis.affected_capability,
+                failure_mode=analysis.failure_mode,
+                lifecycle_state=LifecycleState.NOVEL.value,
+                metadata=meta,
+            )
+            try:
+                _hindsight.retain(mem)
+                retained += 1
+            except HindsightUnavailable:
+                pass
+
+        if progress_cb:
+            progress_cb(i + 1, total, rec["text"][:60].replace("\n", " "))
+
+    return {
+        "imported": total,
         "analyzed": analyzed,
         "retained": retained,
         "themes": len(themes),
