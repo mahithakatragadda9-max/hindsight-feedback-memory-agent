@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+.streamlit/
+data/live_feedback.jsonl
+data/product_changes.jsonl
+data/seed_feedback.jsonl
